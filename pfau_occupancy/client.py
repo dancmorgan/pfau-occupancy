@@ -83,6 +83,7 @@ class PlanetFitnessClient:
         """
         session = self._get_session()
         payload = {"RememberMe": True, "Login": self._email, "Password": self._password}
+        _LOGGER.debug("Logging in as %s", self._email)
         try:
             async with session.post(
                 f"{self._base_url}/Auth/Login",
@@ -90,11 +91,17 @@ class PlanetFitnessClient:
                 headers=self._headers(),
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
-                if resp.status in (400, 401, 403):
-                    raise PlanetFitnessAuthError(
-                        f"Login rejected (HTTP {resp.status}); check credentials."
-                    )
                 if resp.status != 200:
+                    body = (await resp.text())[:500]
+                    _LOGGER.debug(
+                        "Login failed: HTTP %s, body: %s", resp.status, body
+                    )
+                    if resp.status in (400, 401, 403) or _looks_like_bad_credentials(
+                        body
+                    ):
+                        raise PlanetFitnessAuthError(
+                            f"Login rejected (HTTP {resp.status}); check credentials."
+                        )
                     raise PlanetFitnessConnectionError(
                         f"Unexpected login status HTTP {resp.status}."
                     )
@@ -138,6 +145,11 @@ class PlanetFitnessClient:
                 if resp.status in (401, 403):
                     raise PlanetFitnessAuthError("Not authenticated for club fetch.")
                 if resp.status != 200:
+                    _LOGGER.debug(
+                        "Club fetch failed: HTTP %s, body: %s",
+                        resp.status,
+                        (await resp.text())[:500],
+                    )
                     raise PlanetFitnessConnectionError(
                         f"Club fetch failed HTTP {resp.status}."
                     )
@@ -145,6 +157,9 @@ class PlanetFitnessClient:
                 # 200. Guard against that so we don't parse HTML as JSON.
                 ctype = resp.headers.get("content-type", "")
                 if "application/json" not in ctype:
+                    _LOGGER.debug(
+                        "Club fetch returned content-type %r instead of JSON", ctype
+                    )
                     raise PlanetFitnessAuthError(
                         "Club fetch returned non-JSON; session likely expired."
                     )
@@ -153,7 +168,19 @@ class PlanetFitnessClient:
             raise PlanetFitnessConnectionError(f"Club fetch failed: {err}") from err
 
         raw_list = data.get("UsersInClubList") or []
+        _LOGGER.debug("Fetched occupancy for %d clubs", len(raw_list))
         return [Club.from_api(item) for item in raw_list]
+
+
+def _looks_like_bad_credentials(body: str) -> bool:
+    """Detect a credentials rejection hiding behind a non-auth status code.
+
+    The portal reports a wrong password as HTTP 500 with an error payload
+    (e.g. "IncorrectLoginOrPassword") rather than a 401, which would otherwise
+    be misclassified as a connection problem.
+    """
+    lowered = body.lower()
+    return "incorrectloginorpassword" in lowered or "incorrect login" in lowered
 
 
 def _extract_member(data: dict) -> dict:
