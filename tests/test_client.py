@@ -26,12 +26,21 @@ class TestLogin:
         assert headers["X-Public-Facility-Group"].startswith("BRANDEDAPP-")
         assert headers["X-Ms-Web-Context"]
         assert headers["Authorization"].startswith("Basic ")
+        assert headers["User-Agent"] == client_module.USER_AGENT
 
     @pytest.mark.parametrize("status", [400, 401, 403])
     async def test_rejected_credentials(self, client, fake, status: int) -> None:
         fake.login_status = status
 
         with pytest.raises(PlanetFitnessAuthError):
+            await client.async_login()
+
+    async def test_a_firewall_refusal_is_not_a_credentials_error(
+        self, client, fake
+    ) -> None:
+        fake.firewall_refuses_all = True
+
+        with pytest.raises(PlanetFitnessConnectionError, match="firewall"):
             await client.async_login()
 
     async def test_wrong_password(self, portal) -> None:
@@ -97,6 +106,18 @@ class TestGetClubs:
         assert headers["X-Tenant"] == "planet-fitness-au"
         assert headers["X-Public-Facility-Group"].startswith("BRANDEDAPP-")
         assert "SESSION=session-1" in headers["Cookie"]
+        assert headers["User-Agent"] == client_module.USER_AGENT
+
+    async def test_a_firewall_refusal_is_not_an_expired_session(
+        self, client, fake
+    ) -> None:
+        await client.async_get_clubs()
+        fake.firewall_refuses_all = True
+
+        with pytest.raises(PlanetFitnessConnectionError, match="firewall"):
+            await client.async_get_clubs()
+
+        assert fake.logins == 1
 
     async def test_a_new_count_shows_up_on_the_next_poll(self, client, fake) -> None:
         await client.async_get_clubs()
@@ -274,6 +295,20 @@ class TestSharedSession:
 
         assert "session-1" in first_cookie
         assert "session-2" in second_cookie
+
+    async def test_the_sessions_default_user_agent_does_not_reach_the_portal(
+        self, portal
+    ) -> None:
+        # Home Assistant's shared session identifies as "HomeAssistant/...", which
+        # the real portal's firewall refuses with a 403.
+        fake, base_url = portal
+        home_assistant = {"User-Agent": "HomeAssistant/2026.10.0 aiohttp/3.14.5 Python/3.14"}
+        async with aiohttp.ClientSession(headers=home_assistant) as shared:
+            async with PlanetFitnessClient(EMAIL, PASSWORD, shared, base_url) as c:
+                clubs = await c.async_get_clubs()
+
+        assert len(clubs) == 3
+        assert fake.firewall_refusals == 0
 
     async def test_a_caller_supplied_session_is_not_closed(self, portal) -> None:
         _, base_url = portal

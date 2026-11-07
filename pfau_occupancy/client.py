@@ -31,6 +31,22 @@ _STUDIO_CACHE_SECONDS = 6 * 60 * 60
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
+# Say who we are on every request. The portal's CloudFront firewall refuses the
+# generic identity that Home Assistant's shared session would otherwise send
+# ("HomeAssistant/<version> aiohttp/... Python/..."), with an HTTP 403 that has
+# nothing to do with the credentials. A header on the request overrides the
+# session's default, so this holds whichever session is passed in.
+USER_AGENT = "pfau-occupancy (+https://github.com/dancmorgan/pfau-occupancy)"
+
+
+def _is_firewall_refusal(resp: aiohttp.ClientResponse) -> bool:
+    """True for a refusal by the firewall in front of the portal.
+
+    The firewall answers 403 with an HTML page. The portal itself, including
+    when it rejects a login or an expired session, answers in JSON.
+    """
+    return resp.status == 403 and "json" not in resp.content_type
+
 
 class PlanetFitnessClient:
     """Talks to the member portal: login, then fetch occupancy per studio.
@@ -90,6 +106,7 @@ class PlanetFitnessClient:
     def _headers(self) -> dict[str, str]:
         return {
             "Accept": "*/*",
+            "User-Agent": USER_AGENT,
             "Content-Type": "application/json",
             "X-Nox-Client-Type": "WEB",
             "X-Nox-Web-Context": "v=1",
@@ -102,7 +119,8 @@ class PlanetFitnessClient:
         """Authenticate; the session cookie is kept for later requests.
 
         Raises PlanetFitnessAuthError on bad credentials, PlanetFitnessConnectionError
-        on transport problems.
+        on transport problems or when the firewall in front of the portal refuses
+        the request.
         """
         credentials = base64.b64encode(
             f"{self._email}:{self._password}".encode()
@@ -118,6 +136,11 @@ class PlanetFitnessClient:
             ) as resp:
                 if resp.status != 200:
                     _LOGGER.debug("Login failed: HTTP %s", resp.status)
+                    if _is_firewall_refusal(resp):
+                        raise PlanetFitnessConnectionError(
+                            "The portal's firewall refused the login request "
+                            "(HTTP 403); this is not a problem with the credentials."
+                        )
                     if resp.status in (400, 401, 403):
                         raise PlanetFitnessAuthError(
                             f"Login rejected (HTTP {resp.status}); check credentials."
@@ -234,8 +257,9 @@ class PlanetFitnessClient:
     async def _get_json(self, path: str, *, authenticated: bool = True) -> Any:
         """GET a portal path and decode its JSON body.
 
-        401/403 means the session is gone (PlanetFitnessAuthError); other bad
-        statuses, transport errors and non-JSON bodies are connection errors.
+        A JSON 401/403 means the session is gone (PlanetFitnessAuthError); a
+        firewall refusal, other bad statuses, transport errors and non-JSON bodies
+        are connection errors.
         """
         kwargs: dict[str, Any] = {}
         if authenticated:
@@ -247,6 +271,11 @@ class PlanetFitnessClient:
                 timeout=_REQUEST_TIMEOUT,
                 **kwargs,
             ) as resp:
+                if _is_firewall_refusal(resp):
+                    _LOGGER.debug("GET %s refused by the firewall: HTTP 403", path)
+                    raise PlanetFitnessConnectionError(
+                        "The portal's firewall refused the request (HTTP 403)."
+                    )
                 if authenticated and resp.status in (401, 403):
                     raise PlanetFitnessAuthError("Not authenticated for portal request.")
                 if resp.status != 200:

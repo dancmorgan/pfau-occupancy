@@ -68,6 +68,16 @@ looks like one club disappearing and another appearing.
 The session is a cookie held by the client itself, so several clients can share
 one `aiohttp` session without sharing a login.
 
+### Firewall refusals
+
+The portal sits behind a CloudFront firewall that refuses some `User-Agent`s,
+including the `HomeAssistant/...` one Home Assistant's shared `aiohttp` session
+sends by default, with an HTML HTTP 403 before the credentials are even looked
+at. The client therefore sends its own `User-Agent` on every request (it
+overrides the session's), and reports such a refusal as
+`PlanetFitnessConnectionError` rather than `PlanetFitnessAuthError`. A wrong
+password is a JSON 401 and stays an auth error.
+
 ## Trying it against the live portal
 
 ```bash

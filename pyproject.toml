@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfau-occupancy"
-version = "0.2.0a0"
+version = "0.2.0a1"
 description = "Async client for Planet Fitness AU (Magicline) club occupancy"
 readme = "README.md"
 requires-python = ">=3.11"

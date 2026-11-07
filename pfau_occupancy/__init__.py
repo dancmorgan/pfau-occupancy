@@ -7,7 +7,7 @@ from .exceptions import (
 )
 from .models import Club, Studio, slugify_club
 
-__version__ = "0.2.0a0"
+__version__ = "0.2.0a1"
 
 __all__ = [
     "PlanetFitnessClient",

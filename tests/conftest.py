@@ -55,7 +55,11 @@ class FakePortal:
         self.studio_list_body: Any = None
         self.count_body_override: dict[int, Any] = {}
         self.delay = 0.0
+        # The CloudFront firewall in front of the real portal refuses the User-Agent
+        # Home Assistant's shared session sends; this switch refuses everything.
+        self.firewall_refuses_all = False
         # Observations.
+        self.firewall_refusals = 0
         self.logins = 0
         self.studio_list_requests = 0
         self.count_requests: list[int] = []
@@ -70,6 +74,16 @@ class FakePortal:
 
     # ---- handlers -------------------------------------------------------
 
+    @web.middleware
+    async def firewall(self, request: web.Request, handler: Any) -> web.StreamResponse:
+        agent = request.headers.get("User-Agent", "")
+        if self.firewall_refuses_all or agent.startswith("HomeAssistant/"):
+            self.firewall_refusals += 1
+            return web.Response(
+                status=403, text="<html>Request blocked.</html>", content_type="text/html"
+            )
+        return await handler(request)
+
     async def login(self, request: web.Request) -> web.Response:
         self.logins += 1
         self.last_login_request = {
@@ -77,14 +91,18 @@ class FakePortal:
             "json": await request.json(),
         }
         if self.login_status != 200:
-            return web.Response(status=self.login_status)
+            return web.json_response(
+                [{"errorCode": "login.bad.credentials"}], status=self.login_status
+            )
         expected = base64.b64encode(f"{EMAIL}:{PASSWORD}".encode()).decode()
         body = self.last_login_request["json"]
         if (
             request.headers.get("Authorization") != f"Basic {expected}"
             or body != {"username": EMAIL, "password": PASSWORD}
         ):
-            return web.Response(status=401)
+            return web.json_response(
+                [{"errorCode": "login.bad.credentials"}], status=401
+            )
         response = web.Response(status=200)
         if self.login_sets_cookie:
             token = f"session-{self.logins}"
@@ -127,7 +145,7 @@ class FakePortal:
 @pytest.fixture
 async def portal() -> AsyncIterator[tuple[FakePortal, str]]:
     fake = FakePortal()
-    app = web.Application()
+    app = web.Application(middlewares=[fake.firewall])
     app.router.add_post("/login", fake.login)
     app.router.add_get(
         "/studio-api/v1/public/studios/forwhitelabelportal", fake.studio_list
