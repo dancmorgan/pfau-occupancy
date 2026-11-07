@@ -1,6 +1,8 @@
 """The client against a fake portal."""
 from __future__ import annotations
 
+import logging
+
 import aiohttp
 import pytest
 
@@ -63,8 +65,25 @@ class TestLogin:
     ) -> None:
         fake.login_sets_cookie = False
 
-        with pytest.raises(PlanetFitnessAuthError):
+        # The credentials were accepted, so this is not a credentials error.
+        with pytest.raises(PlanetFitnessConnectionError, match="did not start a session"):
             await client.async_login()
+
+    async def test_a_login_without_a_session_describes_the_response_but_leaks_nothing(
+        self, client, fake, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake.login_sets_cookie = False
+
+        with caplog.at_level(logging.DEBUG, logger="pfau_occupancy.client"):
+            with pytest.raises(PlanetFitnessConnectionError):
+                await client.async_login()
+
+        logged = caplog.text
+        assert "Login returned no session cookie: HTTP 200" in logged
+        assert "['access_token', 'sessionId']" in logged
+        assert "Set-Cookie []" in logged
+        for secret in (PASSWORD, "token-value", "session-value"):
+            assert secret not in logged
 
     async def test_unreachable_portal(self) -> None:
         async with PlanetFitnessClient(
@@ -72,6 +91,40 @@ class TestLogin:
         ) as c:
             with pytest.raises(PlanetFitnessConnectionError):
                 await c.async_login()
+
+
+class TestResponseShapes:
+    """What the debug log may say about a response: names and counts, never values."""
+
+    @pytest.mark.parametrize(
+        ("header", "shown"),
+        [
+            ("SESSION=abc123; Path=/; Secure; HttpOnly; SameSite=Lax",
+             "SESSION [path, secure, httponly, samesite]"),
+            ("SESSION=abc123", "SESSION []"),
+            ("a=b; Max-Age=0; Domain=example.com", "a [max-age, domain]"),
+        ],
+    )
+    def test_a_cookie_shows_its_name_and_attribute_names(
+        self, header: str, shown: str
+    ) -> None:
+        assert client_module._cookie_shape(header) == shown
+
+    @pytest.mark.parametrize(
+        ("raw", "content_type", "shown"),
+        [
+            (b"", "application/json", "empty"),
+            (b'{"b": "x", "a": 1}', "application/json", "JSON object with keys ['a', 'b']"),
+            (b'["x"]', "application/json", "JSON list"),
+            (b"{nope", "application/json", "5 bytes, not valid JSON"),
+            (b"<html>", "text/html", "6 bytes, text/html"),
+            (b"abc", "", "3 bytes, no content type"),
+        ],
+    )
+    def test_a_body_shows_its_shape_only(
+        self, raw: bytes, content_type: str, shown: str
+    ) -> None:
+        assert client_module._body_shape(raw, content_type) == shown
 
 
 class TestGetClubs:
@@ -295,6 +348,38 @@ class TestSharedSession:
 
         assert "session-1" in first_cookie
         assert "session-2" in second_cookie
+
+    async def test_a_later_login_does_not_send_the_cookie_a_shared_jar_kept(
+        self, portal
+    ) -> None:
+        # A session with a cookie jar (Home Assistant's shared one) remembers the
+        # portal's session cookie and would send it with every later request.
+        # The jar ignores IP addresses, so this talks to the fake portal by name.
+        fake, base_url = portal
+        url = base_url.replace("127.0.0.1", "localhost")
+        async with aiohttp.ClientSession() as shared:
+            first = PlanetFitnessClient(EMAIL, PASSWORD, shared, url)
+            await first.async_get_clubs()
+            assert fake.logins == 1
+
+            second = PlanetFitnessClient(EMAIL, PASSWORD, shared, url)
+            await second.async_login()
+
+        assert "Cookie" not in fake.last_login_request["headers"]
+
+    async def test_a_second_client_still_gets_a_session_of_its_own(self, portal) -> None:
+        fake, base_url = portal
+        fake.answers_a_live_session_without_a_cookie = True
+        url = base_url.replace("127.0.0.1", "localhost")
+        async with aiohttp.ClientSession() as shared:
+            first = PlanetFitnessClient(EMAIL, PASSWORD, shared, url)
+            second = PlanetFitnessClient(EMAIL, PASSWORD, shared, url)
+
+            await first.async_get_clubs()
+            clubs = await second.async_get_clubs()
+
+        assert len(clubs) == 3
+        assert fake.logins == 2
 
     async def test_the_sessions_default_user_agent_does_not_reach_the_portal(
         self, portal

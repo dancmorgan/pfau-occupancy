@@ -51,6 +51,9 @@ class FakePortal:
         self.fail_status: dict[int, int] = {}
         self.login_status = 200
         self.login_sets_cookie = True
+        # Suspected of the real portal: a login that arrives already carrying a
+        # live session is answered without starting a new one (no Set-Cookie).
+        self.answers_a_live_session_without_a_cookie = False
         self.studio_list_status = 200
         self.studio_list_body: Any = None
         self.count_body_override: dict[int, Any] = {}
@@ -103,8 +106,14 @@ class FakePortal:
             return web.json_response(
                 [{"errorCode": "login.bad.credentials"}], status=401
             )
-        response = web.Response(status=200)
-        if self.login_sets_cookie:
+        # The real portal's answer carries the tokens in the body as well.
+        response = web.json_response(
+            {"access_token": "token-value", "sessionId": "session-value"}
+        )
+        carries_live_session = request.cookies.get("SESSION") in self.active_sessions
+        if self.login_sets_cookie and not (
+            self.answers_a_live_session_without_a_cookie and carries_live_session
+        ):
             token = f"session-{self.logins}"
             self.active_sessions.add(token)
             response.set_cookie("SESSION", token, httponly=True, secure=False)

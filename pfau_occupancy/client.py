@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
+import platform
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -48,6 +51,43 @@ def _is_firewall_refusal(resp: aiohttp.ClientResponse) -> bool:
     return resp.status == 403 and "json" not in resp.content_type
 
 
+def _cookie_shape(header: str) -> str:
+    """A Set-Cookie header reduced to the cookie's name and its attribute names."""
+    name, *attributes = (part.strip() for part in header.split(";"))
+    shown = ", ".join(attribute.split("=", 1)[0].lower() for attribute in attributes)
+    return f"{name.split('=', 1)[0]} [{shown}]"
+
+
+def _body_shape(raw: bytes, content_type: str) -> str:
+    """What a response body looks like, without revealing any of it."""
+    if not raw:
+        return "empty"
+    if "json" in content_type:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return f"{len(raw)} bytes, not valid JSON"
+        if isinstance(data, dict):
+            return f"JSON object with keys {sorted(data)}"
+        return f"JSON {type(data).__name__}"
+    return f"{len(raw)} bytes, {content_type or 'no content type'}"
+
+
+async def _describe_login_response(resp: aiohttp.ClientResponse) -> str:
+    """The shape of a login response, for the debug log when it has no session.
+
+    Names, counts and statuses only. Never a cookie value, the body or a credential.
+    """
+    body = _body_shape(await resp.read(), resp.content_type)
+    set_cookies = [_cookie_shape(header) for header in resp.headers.getall("Set-Cookie", [])]
+    return (
+        f"HTTP {resp.status}, redirects {[r.status for r in resp.history]}, body {body}, "
+        f"headers {sorted({name.lower() for name in resp.headers})}, "
+        f"Set-Cookie {set_cookies}, cookies parsed {sorted(resp.cookies)}, "
+        f"Python {platform.python_version()}, aiohttp {aiohttp.__version__}"
+    )
+
+
 class PlanetFitnessClient:
     """Talks to the member portal: login, then fetch occupancy per studio.
 
@@ -77,6 +117,7 @@ class PlanetFitnessClient:
         self._email = email
         self._password = password
         self._base_url = base_url.rstrip("/")
+        self._host = urlsplit(self._base_url).hostname or ""
         self._tenant = tenant
         self._facility_group = facility_group
         self._session = session
@@ -103,6 +144,17 @@ class PlanetFitnessClient:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    def _forget_shared_cookies(self) -> None:
+        """Keep the aiohttp session's cookie jar out of the portal's requests.
+
+        The login is a cookie this client holds itself. A session that keeps a
+        cookie jar (Home Assistant's shared one does) also remembers it, and
+        would send it with the next request to the portal, whichever client
+        makes it. A later login would then arrive already carrying a session
+        and may be answered without starting a new one.
+        """
+        self._get_session().cookie_jar.clear_domain(self._host)
+
     def _headers(self) -> dict[str, str]:
         return {
             "Accept": "*/*",
@@ -119,14 +171,15 @@ class PlanetFitnessClient:
         """Authenticate; the session cookie is kept for later requests.
 
         Raises PlanetFitnessAuthError on bad credentials, PlanetFitnessConnectionError
-        on transport problems or when the firewall in front of the portal refuses
-        the request.
+        on transport problems, when the firewall in front of the portal refuses
+        the request, or when the portal accepts the login but starts no session.
         """
         credentials = base64.b64encode(
             f"{self._email}:{self._password}".encode()
         ).decode()
         headers = {**self._headers(), "Authorization": f"Basic {credentials}"}
         _LOGGER.debug("Logging in as %s", self._email)
+        self._forget_shared_cookies()
         try:
             async with self._get_session().post(
                 f"{self._base_url}/login",
@@ -151,12 +204,20 @@ class PlanetFitnessClient:
                 self._cookies = {
                     name: morsel.value for name, morsel in resp.cookies.items()
                 }
+                if not self._cookies:
+                    _LOGGER.debug(
+                        "Login returned no session cookie: %s",
+                        await _describe_login_response(resp),
+                    )
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise PlanetFitnessConnectionError(f"Login request failed: {err}") from err
 
         if not self._cookies:
-            # 200 but no session cookie means we are not actually logged in.
-            raise PlanetFitnessAuthError("Login succeeded but no session was started.")
+            # The portal accepted the credentials but sent nothing to keep the
+            # login with, so this is not a rejection of the credentials.
+            raise PlanetFitnessConnectionError(
+                "The portal accepted the login but did not start a session."
+            )
         _LOGGER.debug("Logged in; session established")
 
     async def async_get_clubs(self) -> list[Club]:
@@ -264,6 +325,7 @@ class PlanetFitnessClient:
         kwargs: dict[str, Any] = {}
         if authenticated:
             kwargs["cookies"] = self._cookies
+        self._forget_shared_cookies()
         try:
             async with self._get_session().get(
                 f"{self._base_url}{path}",
