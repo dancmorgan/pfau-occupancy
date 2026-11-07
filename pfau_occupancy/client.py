@@ -1,8 +1,15 @@
-"""Async client for the Planet Fitness AU (PerfectGym ClientPortal2) portal."""
+"""Async client for the Planet Fitness AU member portal (Magicline "MySports")."""
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import logging
+import platform
+import time
+import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -10,32 +17,90 @@ from .exceptions import (
     PlanetFitnessAuthError,
     PlanetFitnessConnectionError,
 )
-from .models import Club
+from .models import Club, Studio, one_club_per_key
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://planetfitness.perfectgym.com.au/clientportal2"
+DEFAULT_BASE_URL = "https://members.planetfitnessaustralia.com.au"
 
-# Sent on every XHR by the browser. The backend checks x-requested-with;
-# cp-lang / cp-mode are constants the portal expects.
-_BASE_HEADERS = {
-    "x-requested-with": "XMLHttpRequest",
-    "cp-lang": "en",
-    "cp-mode": "desktop",
-    "accept": "application/json, text/plain, */*",
-}
+# Identify the brand to the portal. These are configuration the portal's own
+# web app sends on every request, not secrets.
+DEFAULT_TENANT = "planet-fitness-au"
+DEFAULT_FACILITY_GROUP = "BRANDEDAPP-26ED290039B342C98BA951F51312D332"
+
+# The studio list changes only when a club opens or closes, so it is fetched
+# rarely and reused if a refresh fails.
+_STUDIO_CACHE_SECONDS = 6 * 60 * 60
+
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
+
+# Say who we are on every request. The portal's CloudFront firewall refuses the
+# generic identity that Home Assistant's shared session would otherwise send
+# ("HomeAssistant/<version> aiohttp/... Python/..."), with an HTTP 403 that has
+# nothing to do with the credentials. A header on the request overrides the
+# session's default, so this holds whichever session is passed in.
+USER_AGENT = "pfau-occupancy (+https://github.com/dancmorgan/pfau-occupancy)"
+
+
+def _is_firewall_refusal(resp: aiohttp.ClientResponse) -> bool:
+    """True for a refusal by the firewall in front of the portal.
+
+    The firewall answers 403 with an HTML page. The portal itself, including
+    when it rejects a login or an expired session, answers in JSON.
+    """
+    return resp.status == 403 and "json" not in resp.content_type
+
+
+def _cookie_shape(header: str) -> str:
+    """A Set-Cookie header reduced to the cookie's name and its attribute names."""
+    name, *attributes = (part.strip() for part in header.split(";"))
+    shown = ", ".join(attribute.split("=", 1)[0].lower() for attribute in attributes)
+    return f"{name.split('=', 1)[0]} [{shown}]"
+
+
+def _body_shape(raw: bytes, content_type: str) -> str:
+    """What a response body looks like, without revealing any of it."""
+    if not raw:
+        return "empty"
+    if "json" in content_type:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return f"{len(raw)} bytes, not valid JSON"
+        if isinstance(data, dict):
+            return f"JSON object with keys {sorted(data)}"
+        return f"JSON {type(data).__name__}"
+    return f"{len(raw)} bytes, {content_type or 'no content type'}"
+
+
+async def _describe_login_response(resp: aiohttp.ClientResponse) -> str:
+    """The shape of a login response, for the debug log when it has no session.
+
+    Names, counts and statuses only. Never a cookie value, the body or a credential.
+    """
+    body = _body_shape(await resp.read(), resp.content_type)
+    set_cookies = [_cookie_shape(header) for header in resp.headers.getall("Set-Cookie", [])]
+    return (
+        f"HTTP {resp.status}, redirects {[r.status for r in resp.history]}, body {body}, "
+        f"headers {sorted({name.lower() for name in resp.headers})}, "
+        f"Set-Cookie {set_cookies}, cookies parsed {sorted(resp.cookies)}, "
+        f"Python {platform.python_version()}, aiohttp {aiohttp.__version__}"
+    )
 
 
 class PlanetFitnessClient:
-    """Talks to the member portal: login, then fetch club occupancy.
+    """Talks to the member portal: login, then fetch occupancy per studio.
 
-    Holds one aiohttp session so the auth cookie persists across calls. Credentials
-    are kept so the client can transparently re-login when the session expires,
-    which for a long-running poller it eventually will.
+    The portal's live count is per studio, so one poll is one request for the
+    studio list (cached) plus one per studio, run a few at a time.
 
-    The caller owns the aiohttp session lifecycle by passing one in (this is what
-    Home Assistant wants: it supplies its shared session). If none is given, one is
-    created and closed by `async with` / `close()`.
+    The session is a cookie. It is held here rather than in the aiohttp
+    session's cookie jar, so two clients that share one aiohttp session (as
+    Home Assistant's integrations do) never share a login.
+
+    The caller owns the aiohttp session lifecycle by passing one in (this is
+    what Home Assistant wants: it supplies its shared session). If none is
+    given, one is created and closed by `async with` / `close()`.
     """
 
     def __init__(
@@ -44,13 +109,25 @@ class PlanetFitnessClient:
         password: str,
         session: aiohttp.ClientSession | None = None,
         base_url: str = DEFAULT_BASE_URL,
+        *,
+        tenant: str = DEFAULT_TENANT,
+        facility_group: str = DEFAULT_FACILITY_GROUP,
+        max_concurrency: int = 6,
     ) -> None:
         self._email = email
         self._password = password
         self._base_url = base_url.rstrip("/")
+        self._host = urlsplit(self._base_url).hostname or ""
+        self._tenant = tenant
+        self._facility_group = facility_group
         self._session = session
         self._owns_session = session is None
-        self._authenticated = False
+        self._max_concurrency = max(1, max_concurrency)
+        self._cookies: dict[str, str] = {}
+        # Per client, like the web app's per-page-load context id.
+        self._web_context = base64.b64encode(uuid.uuid4().bytes * 2).decode()
+        self._studios: list[Studio] | None = None
+        self._studios_fetched_at = 0.0
 
     async def __aenter__(self) -> "PlanetFitnessClient":
         return self
@@ -64,131 +141,215 @@ class PlanetFitnessClient:
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            # cookie_jar persists the session cookie across requests.
             self._session = aiohttp.ClientSession()
         return self._session
 
+    def _forget_shared_cookies(self) -> None:
+        """Keep the aiohttp session's cookie jar out of the portal's requests.
+
+        The login is a cookie this client holds itself. A session that keeps a
+        cookie jar (Home Assistant's shared one does) also remembers it, and
+        would send it with the next request to the portal, whichever client
+        makes it. A later login would then arrive already carrying a session
+        and may be answered without starting a new one.
+        """
+        self._get_session().cookie_jar.clear_domain(self._host)
+
     def _headers(self) -> dict[str, str]:
         return {
-            **_BASE_HEADERS,
-            "origin": "https://planetfitness.perfectgym.com.au",
-            "referer": self._base_url + "/",
+            "Accept": "*/*",
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "X-Nox-Client-Type": "WEB",
+            "X-Nox-Web-Context": "v=1",
+            "X-Ms-Web-Context": self._web_context,
+            "X-Public-Facility-Group": self._facility_group,
+            "X-Tenant": self._tenant,
         }
 
-    async def async_login(self) -> dict[str, Any]:
-        """Authenticate and return the member record.
+    async def async_login(self) -> None:
+        """Authenticate; the session cookie is kept for later requests.
 
         Raises PlanetFitnessAuthError on bad credentials, PlanetFitnessConnectionError
-        on transport problems.
+        on transport problems, when the firewall in front of the portal refuses
+        the request, or when the portal accepts the login but starts no session.
         """
-        session = self._get_session()
-        payload = {"RememberMe": True, "Login": self._email, "Password": self._password}
+        credentials = base64.b64encode(
+            f"{self._email}:{self._password}".encode()
+        ).decode()
+        headers = {**self._headers(), "Authorization": f"Basic {credentials}"}
         _LOGGER.debug("Logging in as %s", self._email)
+        self._forget_shared_cookies()
         try:
-            async with session.post(
-                f"{self._base_url}/Auth/Login",
-                json=payload,
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=20),
+            async with self._get_session().post(
+                f"{self._base_url}/login",
+                json={"username": self._email, "password": self._password},
+                headers=headers,
+                timeout=_REQUEST_TIMEOUT,
             ) as resp:
                 if resp.status != 200:
-                    body = (await resp.text())[:500]
-                    _LOGGER.debug(
-                        "Login failed: HTTP %s, body: %s", resp.status, body
-                    )
-                    if resp.status in (400, 401, 403) or _looks_like_bad_credentials(
-                        body
-                    ):
+                    _LOGGER.debug("Login failed: HTTP %s", resp.status)
+                    if _is_firewall_refusal(resp):
+                        raise PlanetFitnessConnectionError(
+                            "The portal's firewall refused the login request "
+                            "(HTTP 403); this is not a problem with the credentials."
+                        )
+                    if resp.status in (400, 401, 403):
                         raise PlanetFitnessAuthError(
                             f"Login rejected (HTTP {resp.status}); check credentials."
                         )
                     raise PlanetFitnessConnectionError(
                         f"Unexpected login status HTTP {resp.status}."
                     )
-                data = await resp.json()
-        except aiohttp.ClientError as err:
+                self._cookies = {
+                    name: morsel.value for name, morsel in resp.cookies.items()
+                }
+                if not self._cookies:
+                    _LOGGER.debug(
+                        "Login returned no session cookie: %s",
+                        await _describe_login_response(resp),
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise PlanetFitnessConnectionError(f"Login request failed: {err}") from err
 
-        member = _extract_member(data)
-        if not member:
-            # 200 but no member usually means the session cookie was not set.
-            raise PlanetFitnessAuthError("Login succeeded but no member returned.")
-        self._authenticated = True
-        _LOGGER.debug("Authenticated as member %s", member.get("Id"))
-        return member
+        if not self._cookies:
+            # The portal accepted the credentials but sent nothing to keep the
+            # login with, so this is not a rejection of the credentials.
+            raise PlanetFitnessConnectionError(
+                "The portal accepted the login but did not start a session."
+            )
+        _LOGGER.debug("Logged in; session established")
 
     async def async_get_clubs(self) -> list[Club]:
-        """Fetch occupancy for all clubs.
+        """Fetch live occupancy for every studio.
 
         Logs in automatically if not yet authenticated, and re-logs-in once if the
-        session has expired (detected as an auth failure mid-fetch).
+        session has expired (detected as an auth failure mid-fetch). A studio
+        whose count could not be read comes back with `occupancy` None; only if
+        none could be read does this raise PlanetFitnessConnectionError.
         """
-        if not self._authenticated:
+        if not self._cookies:
             await self.async_login()
         try:
             return await self._fetch_clubs()
         except PlanetFitnessAuthError:
-            # Session likely expired. Re-login once, then retry.
             _LOGGER.debug("Session expired; re-authenticating.")
-            self._authenticated = False
+            self._cookies = {}
             await self.async_login()
             return await self._fetch_clubs()
 
-    async def _fetch_clubs(self) -> list[Club]:
-        session = self._get_session()
+    async def async_get_studios(self) -> list[Studio]:
+        """The studios on the portal, from cache unless it is stale.
+
+        If a refresh fails but there is an older list, that is used rather
+        than failing a poll over reference data that rarely changes.
+        """
+        age = time.monotonic() - self._studios_fetched_at
+        if self._studios is not None and age < _STUDIO_CACHE_SECONDS:
+            return self._studios
         try:
-            async with session.post(
-                f"{self._base_url}/Clubs/Clubs/GetMembersInClubs",
+            data = await self._get_json(
+                "/studio-api/v1/public/studios/forwhitelabelportal", authenticated=False
+            )
+            studios = [Studio.from_api(item) for item in data["content"]]
+        except (PlanetFitnessConnectionError, KeyError, TypeError, ValueError) as err:
+            if self._studios is not None:
+                _LOGGER.debug("Studio list refresh failed (%s); using cached list", err)
+                return self._studios
+            if isinstance(err, PlanetFitnessConnectionError):
+                raise
+            raise PlanetFitnessConnectionError(
+                f"Unexpected studio list response: {err}"
+            ) from err
+        self._studios = studios
+        self._studios_fetched_at = time.monotonic()
+        _LOGGER.debug("Fetched %d studios", len(studios))
+        return studios
+
+    async def _fetch_clubs(self) -> list[Club]:
+        studios = await self.async_get_studios()
+        semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        async def fetch_one(studio: Studio) -> int:
+            async with semaphore:
+                data = await self._get_json(
+                    f"/nox/v1/studios/{studio.studio_id}/utilization/v2/active-checkin"
+                )
+            try:
+                return int(data["value"])
+            except (KeyError, TypeError, ValueError) as err:
+                raise PlanetFitnessConnectionError(
+                    f"Unexpected count for studio {studio.studio_id}: {data!r}"
+                ) from err
+
+        results = await asyncio.gather(
+            *(fetch_one(studio) for studio in studios), return_exceptions=True
+        )
+
+        for result in results:
+            if isinstance(result, PlanetFitnessAuthError):
+                raise result
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures and len(failures) == len(results):
+            first = failures[0]
+            if isinstance(first, PlanetFitnessConnectionError):
+                raise first
+            raise PlanetFitnessConnectionError(f"Occupancy fetch failed: {first}") from first
+        if failures:
+            _LOGGER.debug(
+                "Could not read %d of %d studios; first error: %s",
+                len(failures),
+                len(results),
+                failures[0],
+            )
+
+        clubs = [
+            studio.to_club(None if isinstance(result, BaseException) else result)
+            for studio, result in zip(studios, results)
+        ]
+        unique = one_club_per_key(clubs)
+        if len(unique) != len(clubs):
+            _LOGGER.debug(
+                "Dropped %d studio(s) sharing a name with a better-reporting one",
+                len(clubs) - len(unique),
+            )
+        return unique
+
+    async def _get_json(self, path: str, *, authenticated: bool = True) -> Any:
+        """GET a portal path and decode its JSON body.
+
+        A JSON 401/403 means the session is gone (PlanetFitnessAuthError); a
+        firewall refusal, other bad statuses, transport errors and non-JSON bodies
+        are connection errors.
+        """
+        kwargs: dict[str, Any] = {}
+        if authenticated:
+            kwargs["cookies"] = self._cookies
+        self._forget_shared_cookies()
+        try:
+            async with self._get_session().get(
+                f"{self._base_url}{path}",
                 headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=_REQUEST_TIMEOUT,
+                **kwargs,
             ) as resp:
-                if resp.status in (401, 403):
-                    raise PlanetFitnessAuthError("Not authenticated for club fetch.")
-                if resp.status != 200:
-                    _LOGGER.debug(
-                        "Club fetch failed: HTTP %s, body: %s",
-                        resp.status,
-                        (await resp.text())[:500],
-                    )
+                if _is_firewall_refusal(resp):
+                    _LOGGER.debug("GET %s refused by the firewall: HTTP 403", path)
                     raise PlanetFitnessConnectionError(
-                        f"Club fetch failed HTTP {resp.status}."
+                        "The portal's firewall refused the request (HTTP 403)."
                     )
-                # An expired session can also return the login page (HTML) with a
-                # 200. Guard against that so we don't parse HTML as JSON.
-                ctype = resp.headers.get("content-type", "")
-                if "application/json" not in ctype:
-                    _LOGGER.debug(
-                        "Club fetch returned content-type %r instead of JSON", ctype
+                if authenticated and resp.status in (401, 403):
+                    raise PlanetFitnessAuthError("Not authenticated for portal request.")
+                if resp.status != 200:
+                    _LOGGER.debug("GET %s failed: HTTP %s", path, resp.status)
+                    raise PlanetFitnessConnectionError(
+                        f"Portal request failed HTTP {resp.status}."
                     )
-                    raise PlanetFitnessAuthError(
-                        "Club fetch returned non-JSON; session likely expired."
-                    )
-                data = await resp.json()
-        except aiohttp.ClientError as err:
-            raise PlanetFitnessConnectionError(f"Club fetch failed: {err}") from err
-
-        raw_list = data.get("UsersInClubList") or []
-        _LOGGER.debug("Fetched occupancy for %d clubs", len(raw_list))
-        return [Club.from_api(item) for item in raw_list]
-
-
-def _looks_like_bad_credentials(body: str) -> bool:
-    """Detect a credentials rejection hiding behind a non-auth status code.
-
-    The portal reports a wrong password as HTTP 500 with an error payload
-    (e.g. "IncorrectLoginOrPassword") rather than a 401, which would otherwise
-    be misclassified as a connection problem.
-    """
-    lowered = body.lower()
-    return "incorrectloginorpassword" in lowered or "incorrect login" in lowered
-
-
-def _extract_member(data: dict) -> dict:
-    """Login returns {"User": {"Member": {...}}}; Identity returns {"Member": {...}}.
-
-    Handle both so either response shape confirms authentication.
-    """
-    user = data.get("User")
-    if isinstance(user, dict) and user.get("Member"):
-        return user["Member"]
-    return data.get("Member") or {}
+                try:
+                    return await resp.json(content_type=None)
+                except ValueError as err:
+                    raise PlanetFitnessConnectionError(
+                        "Portal returned a response that is not JSON."
+                    ) from err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise PlanetFitnessConnectionError(f"Portal request failed: {err}") from err

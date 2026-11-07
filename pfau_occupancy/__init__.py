@@ -5,9 +5,9 @@ from .exceptions import (
     PlanetFitnessAuthError,
     PlanetFitnessConnectionError,
 )
-from .models import Club, slugify_club
+from .models import Club, Studio, slugify_club
 
-__version__ = "0.1.1"
+__version__ = "0.2.0a2"
 
 __all__ = [
     "PlanetFitnessClient",
@@ -16,5 +16,6 @@ __all__ = [
     "PlanetFitnessAuthError",
     "PlanetFitnessConnectionError",
     "Club",
+    "Studio",
     "slugify_club",
 ]

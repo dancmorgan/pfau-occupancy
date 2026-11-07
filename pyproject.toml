@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pfau-occupancy"
-version = "0.1.1"
-description = "Async client for Planet Fitness AU (PerfectGym) club occupancy"
+version = "0.2.0a2"
+description = "Async client for Planet Fitness AU (Magicline) club occupancy"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Dan Morgan" }]
-keywords = ["planet fitness", "perfectgym", "home assistant", "occupancy"]
+keywords = ["planet fitness", "magicline", "home assistant", "occupancy"]
 dependencies = ["aiohttp>=3.9"]
 
 [project.urls]
@@ -19,3 +19,14 @@ Issues = "https://github.com/dancmorgan/pfau-occupancy/issues"
 
 [tool.setuptools.packages.find]
 include = ["pfau_occupancy*"]
+
+[tool.setuptools.package-data]
+pfau_occupancy = ["py.typed"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

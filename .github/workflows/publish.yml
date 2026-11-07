@@ -18,6 +18,39 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A PyPI upload cannot be taken back, so check before building that the
+      # tests pass and that the release tag names the version being published.
+      - name: Test
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+          pytest
+
+      - name: Check the release tag matches the package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'EOF'
+          import os
+          import tomllib
+
+          from packaging.version import Version
+
+          import pfau_occupancy
+
+          tag = os.environ["TAG"]
+          with open("pyproject.toml", "rb") as f:
+              declared = tomllib.load(f)["project"]["version"]
+          found = {
+              "release tag": tag.removeprefix("v"),
+              "pyproject.toml": declared,
+              "pfau_occupancy.__version__": pfau_occupancy.__version__,
+          }
+          if len({Version(v) for v in found.values()}) != 1:
+              raise SystemExit(f"Versions disagree: {found}")
+          print(f"Publishing {declared}")
+          EOF
+
       - name: Build
         run: |
           python -m pip install --upgrade build
